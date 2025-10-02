@@ -1,5 +1,6 @@
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <wayland-client.h>
 #include "cairo.h"
 #include "background-image.h"
@@ -8,7 +9,6 @@
 
 #define M_PI 3.14159265358979323846
 const float TYPE_INDICATOR_RANGE = M_PI / 3.0f;
-const float TYPE_INDICATOR_BORDER_THICKNESS = M_PI / 128.0f;
 
 static void set_color_for_state(cairo_t *cairo, struct swaylock_state *state,
 		struct swaylock_colorset *colorset) {
@@ -33,7 +33,23 @@ static void set_color_for_state(cairo_t *cairo, struct swaylock_state *state,
 	}
 }
 
-void render_frame_background(struct swaylock_surface *surface) {
+static void surface_frame_handle_done(void *data, struct wl_callback *callback,
+		uint32_t time) {
+	struct swaylock_surface *surface = data;
+
+	wl_callback_destroy(callback);
+	surface->frame = NULL;
+
+	render(surface);
+}
+
+static const struct wl_callback_listener surface_frame_listener = {
+	.done = surface_frame_handle_done,
+};
+
+static bool render_frame(struct swaylock_surface *surface);
+
+void render(struct swaylock_surface *surface) {
 	struct swaylock_state *state = surface->state;
 
 	int buffer_width = surface->width * surface->scale;
@@ -42,11 +58,17 @@ void render_frame_background(struct swaylock_surface *surface) {
 		return; // not yet configured
 	}
 
-	wl_surface_set_buffer_scale(surface->surface, surface->scale);
+	if (!surface->dirty || surface->frame) {
+		// Nothing to do or frame already pending
+		return;
+	}
+
+	bool need_destroy = false;
+	struct pool_buffer buffer;
 
 	if (buffer_width != surface->last_buffer_width ||
 			buffer_height != surface->last_buffer_height) {
-		struct pool_buffer buffer;
+		need_destroy = true;
 		if (!create_buffer(state->shm, &buffer, buffer_width, buffer_height,
 				WL_SHM_FORMAT_ARGB8888)) {
 			swaylock_log(LOG_ERROR,
@@ -69,15 +91,23 @@ void render_frame_background(struct swaylock_surface *surface) {
 		cairo_restore(cairo);
 		cairo_identity_matrix(cairo);
 
+		wl_surface_set_buffer_scale(surface->surface, surface->scale);
 		wl_surface_attach(surface->surface, buffer.buffer, 0, 0);
 		wl_surface_damage_buffer(surface->surface, 0, 0, INT32_MAX, INT32_MAX);
-		wl_surface_commit(surface->surface);
-		destroy_buffer(&buffer);
+		need_destroy = true;
 
 		surface->last_buffer_width = buffer_width;
 		surface->last_buffer_height = buffer_height;
-	} else {
-		wl_surface_commit(surface->surface);
+	}
+
+	render_frame(surface);
+	surface->dirty = false;
+	surface->frame = wl_surface_frame(surface->surface);
+	wl_callback_add_listener(surface->frame, &surface_frame_listener, surface);
+	wl_surface_commit(surface->surface);
+
+	if (need_destroy) {
+		destroy_buffer(&buffer);
 	}
 }
 
@@ -99,7 +129,7 @@ static void configure_font_drawing(cairo_t *cairo, struct swaylock_state *state,
 	cairo_font_options_destroy(fo);
 }
 
-void render_frame(struct swaylock_surface *surface) {
+static bool render_frame(struct swaylock_surface *surface) {
 	struct swaylock_state *state = surface->state;
 
 	// First, compute the text that will be drawn, if any, since this
@@ -138,19 +168,21 @@ void render_frame(struct swaylock_surface *surface) {
 				}
 			}
 
-			xkb_layout_index_t num_layout = xkb_keymap_num_layouts(state->xkb.keymap);
-			if (!state->args.hide_keyboard_layout &&
-					(state->args.show_keyboard_layout || num_layout > 1)) {
-				xkb_layout_index_t curr_layout = 0;
+			if (state->xkb.keymap) {
+				xkb_layout_index_t num_layout = xkb_keymap_num_layouts(state->xkb.keymap);
+				if (!state->args.hide_keyboard_layout &&
+						(state->args.show_keyboard_layout || num_layout > 1)) {
+					xkb_layout_index_t curr_layout = 0;
 
-				// advance to the first active layout (if any)
-				while (curr_layout < num_layout &&
-					xkb_state_layout_index_is_active(state->xkb.state,
-						curr_layout, XKB_STATE_LAYOUT_EFFECTIVE) != 1) {
-					++curr_layout;
+					// advance to the first active layout (if any)
+					while (curr_layout < num_layout &&
+						xkb_state_layout_index_is_active(state->xkb.state,
+							curr_layout, XKB_STATE_LAYOUT_EFFECTIVE) != 1) {
+						++curr_layout;
+					}
+					// will handle invalid index if none are active
+					layout_text = xkb_keymap_layout_get_name(state->xkb.keymap, curr_layout);
 				}
-				// will handle invalid index if none are active
-				layout_text = xkb_keymap_layout_get_name(state->xkb.keymap, curr_layout);
 			}
 		}
 	}
@@ -212,7 +244,8 @@ void render_frame(struct swaylock_surface *surface) {
 	struct pool_buffer *buffer = get_next_buffer(state->shm,
 			surface->indicator_buffers, buffer_width, buffer_height);
 	if (buffer == NULL) {
-		return;
+		swaylock_log(LOG_ERROR, "No buffer");
+		return false;
 	}
 
 	// Render the buffer
@@ -227,9 +260,6 @@ void render_frame(struct swaylock_surface *surface) {
 	cairo_set_operator(cairo, CAIRO_OPERATOR_SOURCE);
 	cairo_paint(cairo);
 	cairo_restore(cairo);
-
-	float type_indicator_border_thickness =
-		TYPE_INDICATOR_BORDER_THICKNESS * surface->scale;
 
 	if (draw_indicator) {
 		// Fill inner circle
@@ -291,16 +321,29 @@ void render_frame(struct swaylock_surface *surface) {
 			cairo_stroke(cairo);
 
 			// Draw borders
+			double inner_radius = buffer_diameter / 2.0 - arc_thickness * 1.5;
+			double outer_radius = buffer_diameter / 2.0 - arc_thickness / 2.0;
+
+			cairo_set_line_width(cairo, 2.0 * surface->scale);
 			cairo_set_source_u32(cairo, state->args.colors.separator);
-			cairo_arc(cairo, buffer_width / 2, buffer_diameter / 2,
-					arc_radius, highlight_start,
-					highlight_start + type_indicator_border_thickness);
+			cairo_move_to(cairo,
+				buffer_width / 2.0 + cos(highlight_start) * inner_radius,
+				buffer_diameter / 2.0 + sin(highlight_start) * inner_radius
+			);
+			cairo_line_to(cairo,
+				buffer_width / 2.0 + cos(highlight_start) * outer_radius,
+				buffer_diameter / 2.0 + sin(highlight_start) * outer_radius
+			);
 			cairo_stroke(cairo);
 
-			cairo_arc(cairo, buffer_width / 2, buffer_diameter / 2,
-					arc_radius, highlight_start + TYPE_INDICATOR_RANGE,
-					highlight_start + TYPE_INDICATOR_RANGE +
-						type_indicator_border_thickness);
+			cairo_move_to(cairo,
+				buffer_width / 2.0 + cos(highlight_start + TYPE_INDICATOR_RANGE) * inner_radius,
+				buffer_diameter / 2.0 + sin(highlight_start + TYPE_INDICATOR_RANGE) * inner_radius
+			);
+			cairo_line_to(cairo,
+				buffer_width / 2.0 + cos(highlight_start + TYPE_INDICATOR_RANGE) * outer_radius,
+				buffer_diameter / 2.0 + sin(highlight_start + TYPE_INDICATOR_RANGE) * outer_radius
+			);
 			cairo_stroke(cairo);
 		}
 
@@ -354,5 +397,5 @@ void render_frame(struct swaylock_surface *surface) {
 	wl_surface_damage_buffer(surface->child, 0, 0, INT32_MAX, INT32_MAX);
 	wl_surface_commit(surface->child);
 
-	wl_surface_commit(surface->surface);
+	return true;
 }

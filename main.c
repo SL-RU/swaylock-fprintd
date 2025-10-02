@@ -1,4 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -94,6 +93,9 @@ static void daemonize(void) {
 }
 
 static void destroy_surface(struct swaylock_surface *surface) {
+	if (surface->frame != NULL) {
+		wl_callback_destroy(surface->frame);
+	}
 	wl_list_remove(&surface->link);
 	if (surface->ext_session_lock_surface_v1 != NULL) {
 		ext_session_lock_surface_v1_destroy(surface->ext_session_lock_surface_v1);
@@ -164,59 +166,19 @@ static void ext_session_lock_surface_v1_handle_configure(void *data,
 	surface->width = width;
 	surface->height = height;
 	ext_session_lock_surface_v1_ack_configure(lock_surface, serial);
-	render_frame_background(surface);
-	render_frame(surface);
+	surface->dirty = true;
+	render(surface);
 }
 
 static const struct ext_session_lock_surface_v1_listener ext_session_lock_surface_v1_listener = {
 	.configure = ext_session_lock_surface_v1_handle_configure,
 };
 
-static const struct wl_callback_listener surface_frame_listener;
-
-static void surface_frame_handle_done(void *data, struct wl_callback *callback,
-		uint32_t time) {
-	struct swaylock_surface *surface = data;
-
-	wl_callback_destroy(callback);
-	surface->frame_pending = false;
-
-	if (surface->dirty) {
-		// Schedule a frame in case the surface is damaged again
-		struct wl_callback *callback = wl_surface_frame(surface->surface);
-		wl_callback_add_listener(callback, &surface_frame_listener, surface);
-		surface->frame_pending = true;
-
-		render_frame(surface);
-		surface->dirty = false;
-	}
-}
-
-static const struct wl_callback_listener surface_frame_listener = {
-	.done = surface_frame_handle_done,
-};
-
-void damage_surface(struct swaylock_surface *surface) {
-	if (surface->width == 0 || surface->height == 0) {
-		// Not yet configured
-		return;
-	}
-
-	surface->dirty = true;
-	if (surface->frame_pending) {
-		return;
-	}
-
-	struct wl_callback *callback = wl_surface_frame(surface->surface);
-	wl_callback_add_listener(callback, &surface_frame_listener, surface);
-	surface->frame_pending = true;
-	wl_surface_commit(surface->surface);
-}
-
 void damage_state(struct swaylock_state *state) {
 	struct swaylock_surface *surface;
 	wl_list_for_each(surface, &state->surfaces, link) {
-		damage_surface(surface);
+		surface->dirty = true;
+		render(surface);
 	}
 }
 
@@ -227,7 +189,8 @@ static void handle_wl_output_geometry(void *data, struct wl_output *wl_output,
 	struct swaylock_surface *surface = data;
 	surface->subpixel = subpixel;
 	if (surface->state->run_display) {
-		damage_surface(surface);
+		surface->dirty = true;
+		render(surface);
 	}
 }
 
@@ -248,7 +211,8 @@ static void handle_wl_output_scale(void *data, struct wl_output *output,
 	struct swaylock_surface *surface = data;
 	surface->scale = factor;
 	if (surface->state->run_display) {
-		damage_surface(surface);
+		surface->dirty = true;
+		render(surface);
 	}
 }
 
@@ -437,7 +401,7 @@ static void load_image(char *arg, struct swaylock_state *state) {
 }
 
 static void set_default_colors(struct swaylock_colors *colors) {
-	colors->background = 0xFFFFFFFF;
+	colors->background = 0xA3A3A3FF;
 	colors->bs_highlight = 0xDB3300FF;
 	colors->key_highlight = 0x33DB00FF;
 	colors->caps_lock_bs_highlight = 0xDB3300FF;
@@ -587,7 +551,7 @@ static int parse_options(int argc, char **argv, struct swaylock_state *state,
 		"  -C, --config <config_file>       "
 			"Path to the config file.\n"
 		"  -c, --color <color>              "
-			"Turn the screen into the given color instead of white.\n"
+			"Turn the screen into the given color instead of light gray.\n"
 		"  -d, --debug                      "
 			"Enable debugging output.\n"
 		"  -e, --ignore-empty-password      "
@@ -1082,14 +1046,23 @@ static void display_in(int fd, short mask, void *data) {
 }
 
 static void comm_in(int fd, short mask, void *data) {
-	if (read_comm_reply()) {
-		// Authentication succeeded
-		state.run_display = false;
-	} else {
-		state.auth_state = AUTH_STATE_INVALID;
-		schedule_auth_idle(&state);
-		++state.failed_attempts;
-		damage_state(&state);
+	if (mask & POLLIN) {
+		bool auth_success = false;
+		if (!read_comm_reply(&auth_success)) {
+			exit(EXIT_FAILURE);
+		}
+		if (auth_success) {
+			// Authentication succeeded
+			state.run_display = false;
+		} else {
+			state.auth_state = AUTH_STATE_INVALID;
+			schedule_auth_idle(&state);
+			++state.failed_attempts;
+			damage_state(&state);
+		}
+	} else if (mask & (POLLHUP | POLLERR)) {
+		swaylock_log(LOG_ERROR,	"Password checking subprocess crashed; exiting.");
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -1206,6 +1179,7 @@ int main(int argc, char **argv) {
 	if (!state.password.buffer) {
 		return EXIT_FAILURE;
 	}
+	state.password.buffer[0] = 0;
 
 	if (pipe(sigusr_fds) != 0) {
 		swaylock_log(LOG_ERROR, "Failed to pipe");

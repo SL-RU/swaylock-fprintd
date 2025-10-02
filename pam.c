@@ -72,6 +72,11 @@ static const char *get_pam_auth_error(int pam_status) {
 
 void run_pw_backend_child(void) {
 	struct passwd *passwd = getpwuid(getuid());
+	if (!passwd) {
+		swaylock_log_errno(LOG_ERROR, "getpwuid failed");
+		exit(EXIT_FAILURE);
+	}
+
 	char *username = passwd->pw_name;
 
 	const struct pam_conv conv = {
@@ -108,6 +113,12 @@ void run_pw_backend_child(void) {
 
 		if (!write_comm_reply(success)) {
 			exit(EXIT_FAILURE);
+		}
+
+		if (success) {
+			/* Unsuccessful requests may be queued after a successful one;
+			 * do not process them. */
+			break;
 		}
 	}
 
