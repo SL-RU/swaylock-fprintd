@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <linux/input-event-codes.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -26,6 +27,7 @@
 #include "seat.h"
 #include "swaylock.h"
 #include "ext-session-lock-v1-client-protocol.h"
+#include "virtual-keyboard-unstable-v1-client-protocol.h"
 #include "fingerprint/fingerprint.h"
 
 static uint32_t parse_color(const char *color) {
@@ -306,6 +308,9 @@ static void handle_global(void *data, struct wl_registry *registry,
 		struct swaylock_seat *swaylock_seat =
 			calloc(1, sizeof(struct swaylock_seat));
 		swaylock_seat->state = state;
+		swaylock_seat->wl_seat = seat;
+		swaylock_seat->caps = 0;
+		wl_list_insert(&state->seats, &swaylock_seat->link);
 		wl_seat_add_listener(seat, &seat_listener, swaylock_seat);
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
 		struct swaylock_surface *surface =
@@ -319,6 +324,10 @@ static void handle_global(void *data, struct wl_registry *registry,
 	} else if (strcmp(interface, ext_session_lock_manager_v1_interface.name) == 0) {
 		state->ext_session_lock_manager_v1 = wl_registry_bind(registry, name,
 				&ext_session_lock_manager_v1_interface, 1);
+	} else if (strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name) == 0) {
+		state->virtual_keyboard_manager = wl_registry_bind(registry, name,
+				&zwp_virtual_keyboard_manager_v1_interface, 1);
+		ensure_virtual_keyboard_for_seats(state);
 	}
 }
 
@@ -1123,9 +1132,33 @@ void log_init(int argc, char **argv) {
 	swaylock_log_init(LOG_ERROR);
 }
 
+static void poke_virtual_keyboard(struct swaylock_state *state) {
+	if (!state->virtual_keyboard) {
+		return;
+	}
+
+	ensure_virtual_keyboard_keymap(state);
+	if (!state->virtual_keyboard_keymap_set) {
+		return;
+	}
+
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return;
+	}
+
+	uint32_t time = (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+	zwp_virtual_keyboard_v1_key(state->virtual_keyboard, time,
+			KEY_LEFTSHIFT, WL_KEYBOARD_KEY_STATE_PRESSED);
+	zwp_virtual_keyboard_v1_key(state->virtual_keyboard, time,
+			KEY_LEFTSHIFT, WL_KEYBOARD_KEY_STATE_RELEASED);
+	wl_display_flush(state->display);
+}
+
 static void check_fingerprint(void *d) {
 	struct FingerprintState *fingerprint_state = d;
 	if (fingerprint_verify(fingerprint_state)) {
+		poke_virtual_keyboard(&state);
 		do_sigusr(1);
 	} else {
 		(void)write(sigusr_fds[1], NULL, 0);
@@ -1217,6 +1250,7 @@ int main(int argc, char **argv) {
 	}
 
 	wl_list_init(&state.surfaces);
+	wl_list_init(&state.seats);
 	state.xkb.context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	state.display = wl_display_connect(NULL);
 	if (!state.display) {
@@ -1324,6 +1358,14 @@ int main(int argc, char **argv) {
 
 	if(state.args.fingerprint) {
 		fingerprint_deinit(&fingerprint_state);
+	}
+	if (state.virtual_keyboard) {
+		zwp_virtual_keyboard_v1_destroy(state.virtual_keyboard);
+		state.virtual_keyboard = NULL;
+	}
+	if (state.virtual_keyboard_manager) {
+		zwp_virtual_keyboard_manager_v1_destroy(state.virtual_keyboard_manager);
+		state.virtual_keyboard_manager = NULL;
 	}
 	free(state.args.font);
 	cairo_destroy(state.test_cairo);
