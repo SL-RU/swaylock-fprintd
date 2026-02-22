@@ -43,6 +43,7 @@ rt = cc.find_library('rt')
 git = find_program('git', required: false)
 scdoc = find_program('scdoc', required: get_option('man-pages'))
 wayland_scanner_prog = find_program(wayland_scanner.get_variable('wayland_scanner'), native: true)
+curl = find_program('curl', required: true)
 
 version = meson.project_version()
 if git.found()
@@ -70,6 +71,15 @@ wayland_scanner_client = generator(
 client_protocols = [
 	wl_protocol_dir / 'staging/ext-session-lock/ext-session-lock-v1.xml',
 ]
+
+virtual_keyboard_xml = custom_target('virtual-keyboard-unstable-v1.xml',
+	output: 'virtual-keyboard-unstable-v1.xml',
+	command: [curl, '-L', '-o', '@OUTPUT@',
+		'https://raw.githubusercontent.com/swaywm/wlroots/master/protocol/virtual-keyboard-unstable-v1.xml'],
+	build_by_default: true,
+)
+
+client_protocols += [virtual_keyboard_xml]
 
 protos_src = []
 foreach xml : client_protocols

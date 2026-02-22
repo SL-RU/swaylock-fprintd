@@ -49,6 +49,9 @@ struct swaylock_colors {
 	struct swaylock_colorset text;
 };
 
+struct zwp_virtual_keyboard_manager_v1;
+struct zwp_virtual_keyboard_v1;
+
 struct swaylock_args {
 	struct swaylock_colors colors;
 	enum background_mode mode;
@@ -89,6 +92,7 @@ struct swaylock_state {
 	struct wl_subcompositor *subcompositor;
 	struct wl_shm *shm;
 	struct wl_list surfaces;
+	struct wl_list seats;
 	struct wl_list images;
 	struct swaylock_args args;
 	struct swaylock_password password;
@@ -102,6 +106,9 @@ struct swaylock_state {
 	bool run_display, locked;
 	struct ext_session_lock_manager_v1 *ext_session_lock_manager_v1;
 	struct ext_session_lock_v1 *ext_session_lock_v1;
+	struct zwp_virtual_keyboard_manager_v1 *virtual_keyboard_manager;
+	struct zwp_virtual_keyboard_v1 *virtual_keyboard;
+	bool virtual_keyboard_keymap_set;
 	char *fingerprint_msg;
 };
 

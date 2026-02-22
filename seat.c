@@ -1,12 +1,96 @@
+#define _POSIX_C_SOURCE 200809L
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <xkbcommon/xkbcommon.h>
+#include "virtual-keyboard-unstable-v1-client-protocol.h"
 #include "log.h"
 #include "swaylock.h"
 #include "seat.h"
 #include "loop.h"
+
+static int write_keymap_fd(const char *keymap, size_t size) {
+	char template[] = "/tmp/swaylock-keymap-XXXXXX";
+	int fd = mkstemp(template);
+	if (fd < 0) {
+		swaylock_log_errno(LOG_ERROR, "Unable to create keymap file");
+		return -1;
+	}
+
+	unlink(template);
+	size_t offset = 0;
+	while (offset < size) {
+		ssize_t written = write(fd, keymap + offset, size - offset);
+		if (written < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			swaylock_log_errno(LOG_ERROR, "Unable to write keymap");
+			close(fd);
+			return -1;
+		}
+		offset += written;
+	}
+
+	if (lseek(fd, 0, SEEK_SET) < 0) {
+		swaylock_log_errno(LOG_ERROR, "Unable to rewind keymap file");
+		close(fd);
+		return -1;
+	}
+
+	return fd;
+}
+
+static void set_virtual_keyboard_keymap(struct swaylock_state *state) {
+	if (!state->virtual_keyboard || state->virtual_keyboard_keymap_set ||
+			state->xkb.keymap == NULL) {
+		return;
+	}
+
+	char *keymap = xkb_keymap_get_as_string(state->xkb.keymap,
+			XKB_KEYMAP_FORMAT_TEXT_V1);
+	if (!keymap) {
+		swaylock_log(LOG_ERROR, "Unable to serialize keymap");
+		return;
+	}
+
+	size_t size = strlen(keymap) + 1;
+	int fd = write_keymap_fd(keymap, size);
+	if (fd < 0) {
+		free(keymap);
+		return;
+	}
+
+	zwp_virtual_keyboard_v1_keymap(state->virtual_keyboard,
+			WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, size);
+	close(fd);
+	free(keymap);
+	state->virtual_keyboard_keymap_set = true;
+}
+
+static void ensure_virtual_keyboard(struct swaylock_seat *seat) {
+	struct swaylock_state *state = seat->state;
+	if (!state->virtual_keyboard_manager || state->virtual_keyboard) {
+		return;
+	}
+	if (!(seat->caps & WL_SEAT_CAPABILITY_KEYBOARD)) {
+		return;
+	}
+
+	state->virtual_keyboard =
+		zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
+			state->virtual_keyboard_manager, seat->wl_seat);
+	state->virtual_keyboard_keymap_set = false;
+	set_virtual_keyboard_keymap(state);
+}
+
+void ensure_virtual_keyboard_keymap(struct swaylock_state *state) {
+	set_virtual_keyboard_keymap(state);
+}
 
 static void keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
 		uint32_t format, int32_t fd, uint32_t size) {
@@ -35,6 +119,8 @@ static void keyboard_keymap(void *data, struct wl_keyboard *wl_keyboard,
 	xkb_state_unref(state->xkb.state);
 	state->xkb.keymap = keymap;
 	state->xkb.state = xkb_state;
+	state->virtual_keyboard_keymap_set = false;
+	set_virtual_keyboard_keymap(state);
 }
 
 static void keyboard_enter(void *data, struct wl_keyboard *wl_keyboard,
@@ -189,6 +275,7 @@ static const struct wl_pointer_listener pointer_listener = {
 static void seat_handle_capabilities(void *data, struct wl_seat *wl_seat,
 		enum wl_seat_capability caps) {
 	struct swaylock_seat *seat = data;
+	seat->caps = caps;
 	if (seat->pointer) {
 		wl_pointer_release(seat->pointer);
 		seat->pointer = NULL;
@@ -204,12 +291,20 @@ static void seat_handle_capabilities(void *data, struct wl_seat *wl_seat,
 	if ((caps & WL_SEAT_CAPABILITY_KEYBOARD)) {
 		seat->keyboard = wl_seat_get_keyboard(wl_seat);
 		wl_keyboard_add_listener(seat->keyboard, &keyboard_listener, seat);
+		ensure_virtual_keyboard(seat);
 	}
 }
 
 static void seat_handle_name(void *data, struct wl_seat *wl_seat,
 		const char *name) {
 	// Who cares
+}
+
+void ensure_virtual_keyboard_for_seats(struct swaylock_state *state) {
+	struct swaylock_seat *seat;
+	wl_list_for_each(seat, &state->seats, link) {
+		ensure_virtual_keyboard(seat);
+	}
 }
 
 const struct wl_seat_listener seat_listener = {
