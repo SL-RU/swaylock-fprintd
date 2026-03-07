@@ -92,7 +92,7 @@ dependencies = [
 	rt,
 	xkbcommon,
 	wayland_client,
-        fingerprint
+	fingerprint
 ]
 
 sources = [
